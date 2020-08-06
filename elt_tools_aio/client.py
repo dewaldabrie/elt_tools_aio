@@ -9,7 +9,7 @@ from sqlalchemy import MetaData, Table
 from sqlalchemy.exc import OperationalError
 from psycopg2.errors import SerializationFailure
 from typing import Dict, Set, List, Tuple, Optional
-from elt_tools.engines import engine_from_settings
+from elt_tools_aio.engines import engine_from_settings
 
 
 def _construct_where_clause_from_timerange(

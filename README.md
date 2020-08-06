@@ -1,4 +1,4 @@
-# ELT-Tools
+# ELT-Tools-AIO
 ![GitHub Last Commit](https://img.shields.io/github/last-commit/google/skia.svg?style=flat-square&colorA=4c566a&colorB=a3be8c)
 [![GitHub Issues](https://img.shields.io/github/issues/dewaldabrie/elt_tools_aio.svg?style=flat-square&colorA=4c566a&colorB=ebcb8b)](https://github.com/dewaldabrie/elt_tools_aio/issues)
 [![GitHub Stars](https://img.shields.io/github/stars/dewaldabrie/elt_tools_aio.svg?style=flat-square&colorB=ebcb8b&colorA=4c566a)](https://github.com/dewaldabrie/elt_tools_aio/stargazers)
@@ -48,7 +48,7 @@ For example, to find duplicate on a particular table:
 ```python
 import asyncio
 from os import environ
-from elt_tools.client import DataClientFactory
+from elt_tools_aio.client import DataClientFactory
 
 DATABASES = {
     'db_key11': {
@@ -79,7 +79,7 @@ using a binary search strategy on a large table:
 ```python
 import asyncio
 from os import environ
-from elt_tools.client import ELTDBPairFactory
+from elt_tools_aio.client import ELTDBPairFactory
 
 DATABASES = {
     'db_key11': {

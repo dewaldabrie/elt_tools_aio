@@ -27,7 +27,7 @@ setup(
     ],
     keywords='SQLAlchemy GCP Google BigQuery SQL ETL ELT RDBMS asycio monitoring fix',
     packages=find_packages(),
-    install_requires=['SQLAlchemy',
+    install_requires=['SQLAlchemy-aio',
                       'PyBigQuery',
                       'PyMySQL',
                       'psycopg2',
