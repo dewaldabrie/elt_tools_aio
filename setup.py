@@ -1,4 +1,5 @@
 """A setuptools based setup module."""
+
 from os import path
 from setuptools import setup, find_packages
 from io import open
@@ -10,12 +11,12 @@ with open(path.join(here, 'README.md'), encoding='utf-8') as f:
     long_description = f.read()
 
 setup(
-    name='elt-tools',
+    name='elt-tools-aio',
     version='1.0.0',
-    description='Tools for troubleshooting ELT arrangements',
+    description='Async Tools for Monitoring and Troubleshooting ELT arrangements',
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/brightwrite/elt_tools',
+    url='https://github.com/dewaldabrie/elt_tools_aio',
     author='Dewald Abrie',
     author_email='dewaldabrie@gmail.com',
     classifiers=[
@@ -24,15 +25,13 @@ setup(
         'Programming Language :: Python :: 3.7',
         'Programming Language :: Python :: 3.8',
     ],
-    keywords='SQLAlchemy GCP Google BigQuery SQL ETL RDBMS',
+    keywords='SQLAlchemy GCP Google BigQuery SQL ETL ELT RDBMS asycio monitoring fix',
     packages=find_packages(),
     install_requires=['SQLAlchemy',
                       'PyBigQuery',
                       'PyMySQL',
                       'psycopg2',
                       'sqlalchemy-redshift',
-                      'retrying',
-                      'timeout-decorator'
                       ],
     extras_require={
         'dev': ['check-manifest'],
@@ -40,7 +39,7 @@ setup(
         'env': ['python-dotenv']
     },
     project_urls={
-        'Bug Reports': 'https://github.com/brightwrite/elt_tools/issues',
-        'Source': 'https://github.com/brightwrite/elt_tools',
+        'Bug Reports': 'https://github.com/dewaldabrie/elt_tools_aio/issues',
+        'Source': 'https://github.com/dewaldabrie/elt_tools_aio',
     },
 )

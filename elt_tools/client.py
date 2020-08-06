@@ -1,16 +1,15 @@
 """Generic Client for interacting with data sources."""
+from typing import *
+import asyncio
+import time
 import datetime
 import logging
-import timeout_decorator
-from timeout_decorator import TimeoutError
 import math
-from retrying import retry
 from sqlalchemy import MetaData, Table
 from sqlalchemy.exc import OperationalError
 from psycopg2.errors import SerializationFailure
 from typing import Dict, Set, List, Tuple, Optional
 from elt_tools.engines import engine_from_settings
-
 
 
 def _construct_where_clause_from_timerange(
@@ -81,50 +80,57 @@ class DataClient:
     def from_settings(cls, database_settings: Dict, db_key):
         return cls(engine_from_settings(db_key, database_settings=database_settings))
 
-    def table(self, table_name):
+    async def get_table(self, table_name):
+        logging.debug(f"Inspecting table {table_name}")
+        t = Table(table_name, self.metadata, autoload_with=self.engine)  #, autoload_with=self.engine.sync_engine)
+        return t
+
+    async def table(self, table_name):
         """Introspect Table object from engine metadata."""
         if table_name in self._tables:
             logging.debug(f"Using cached definition of table {table_name}")
             return self._tables[table_name]
         else:
-            logging.debug(f"Inspecting table {table_name}")
-            t = Table(table_name, self.metadata, autoload=True)
-            self._tables[table_name] = t
+            self._tables[table_name] = await self.get_table(table_name)
             logging.debug("Introspection done.")
-            return t
+            return self._tables[table_name]
 
-    def insert_rows(self, rows, table=None, replace=None):
+    async def insert_rows(self, rows, table=None, replace=None):
         """Insert rows into table."""
         if replace:
-            self.engine.execute(f'TRUNCATE TABLE {table}')
+            await self.engine.execute(f'TRUNCATE TABLE {table}')
         self.table_name = table
-        self.engine.execute(self.table.insert(), rows)
+        _table = self.table(table)
+        await self.engine.execute(_table.insert(), rows)
         return self.construct_response(rows, table)
 
-    def delete_rows(self, table_name, key_field, primary_keys=None ):
+    async def delete_rows(self, table_name, key_field, primary_keys=None):
         if not primary_keys:
             logging.error("Pass in the primary keys to delete.")
             return
+
         def format_primary_key(key):
             if isinstance(key, int):
                 return str(key)
             else:
                 return f"'{str(key)}'"
+
         query = f"""
         DELETE {table_name} WHERE {key_field} IN ({','.join(map(format_primary_key, primary_keys))})
         """
         logging.info(query)
-        self.query(query)
+        await self.query(query)
 
-    def fetch_rows(self, query):
+    async def fetch_rows(self, query):
         """Fetch all rows via query."""
-        connection = self.engine.connect()
-        rows = connection.execute(query).fetchall()
-        connection.close()
+        async with self.engine.connect() as connection:
+            row_proxy = await connection.execute(query)
+            rows = await row_proxy.fetchall()
+        # await connection.close()
         return rows
 
-    def query(self, query):
-        return [dict(r) for r in self.fetch_rows(query)]
+    async def query(self, query):
+        return [dict(r) for r in await self.fetch_rows(query)]
 
     @staticmethod
     def construct_response(rows, table):
@@ -134,7 +140,7 @@ class DataClient:
         num_rows = len(rows)
         return f'Inserted {num_rows} rows into `{table}` with {len(columns)} columns: {column_names}'
 
-    def count(
+    async def count(
             self,
             table_name,
             field_name=None,
@@ -143,11 +149,14 @@ class DataClient:
             timestamp_fields: List[str] = None,
             stick_to_dates: bool = False,
             recursion_count=0,
+            timeout=60,
     ) -> int:
         """
         Optionally pass in timestamp fields and time range to limit the query_range.
         """
-        if recursion_count == 2:
+        if recursion_count > 0:
+            timeout = 999
+        if recursion_count == 3:
             raise ValueError("Could not complete count for table %s, too many failed attempts." % table_name)
 
         if not field_name:
@@ -165,18 +174,24 @@ class DataClient:
         count_query = unfiltered_count_query + where_clause
         logging.debug("Count query is %s" % count_query)
         try:
-            result = self.query(count_query)[0]['count']
+            result_set = await asyncio.wait_for(self.query(count_query), timeout=timeout)
+            result = result_set[0]['count']
         # sometimes with postgres dbs we encounter SerializationFailure when we query the slave and master
         # interrupts it. In this case, we sub-divide the query time range.
-        except (OperationalError, SerializationFailure, TimeoutError) as e:
+        except (OperationalError, SerializationFailure, asyncio.TimeoutError) as e:
+            if isinstance(e, OperationalError) and 'SerializationFailure' not in str(e):
+                raise
+            if isinstance(e, TimeoutError):
+                time.sleep(10)
             if where_clause:
                 range_len = math.floor((end_datetime - start_datetime) / datetime.timedelta(hours=24))
-                logging.info("Encountered exception with count query across %d days. Aggregating over single days. %s" % (
-                    range_len, str(e)))
+                logging.info(
+                    "Encountered exception with count query across %d days. Aggregating over single days. %s" % (
+                        range_len, str(e)))
                 range_split = [start_datetime + datetime.timedelta(days=n) for n in range(range_len)] + [end_datetime]
                 result = 0
                 for sub_start, sub_end in zip(range_split, range_split[1:]):
-                    sub_count = self.count(
+                    sub_count = await self.count(
                         table_name,
                         field_name,
                         start_datetime=sub_start,
@@ -190,11 +205,12 @@ class DataClient:
                 raise
         return result
 
-    def get_primary_key(self, table_name: str) -> Optional[str]:
+    async def get_primary_key(self, table_name: str) -> Optional[str]:
         """
         Inspect the table to find the primary key.
         """
-        prim_key = self.table(table_name).primary_key
+        table = await self.table(table_name)
+        prim_key = table.primary_key
         if prim_key:
             key_cols = list(prim_key.columns)
             if len(key_cols) > 1:
@@ -208,7 +224,7 @@ class DataClient:
             else:
                 return None
 
-    def get_all_tables(self) -> List[str]:
+    async def get_all_tables(self) -> List[str]:
         """
         List all the table names present in the schema definition.
         """
@@ -218,25 +234,25 @@ class DataClient:
                 FROM {bq_schema}INFORMATION_SCHEMA.TABLES
               ORDER BY table_name
             '''.format(
-            bq_schema=self.engine.url.database + '.' if self.engine.name == 'bigquery' else ''
+            bq_schema=self.engine._engine.url.database + '.' if self.engine._engine.name == 'bigquery' else ''
         )
-        tables = self.fetch_rows(query)
+        tables = await self.fetch_rows(query)
         for table in tables:
             source_db_tables.append(table[0])
         return source_db_tables
 
-    def find_duplicate_keys(self, table_name, key_field):
+    async def find_duplicate_keys(self, table_name, key_field):
         """Find if a table has duplicates by a certain column, if so return all the instances that
         have duplicates together with their counts."""
         query = f"""
         SELECT {key_field}, COUNT({key_field}) as count
         FROM {table_name}
         GROUP BY 1
-        HAVING count > 1;
+        HAVING COUNT({key_field}) > 1;
         """
-        return self.fetch_rows(query)
+        return await self.fetch_rows(query)
 
-    def _find_partition_expression(self, table_name):
+    async def _find_partition_expression(self, table_name):
         """
            Note: this currently only supports Google Biquery
         """
@@ -246,7 +262,7 @@ class DataClient:
             WHERE table_name = '{table_name}'
               AND is_partitioning_column = 'YES';
         """
-        partition_field_result = self.query(partition_field_sql)
+        partition_field_result = await self.query(partition_field_sql)
         partition_field_expr = None
         partition_field_name = None
         partition_field_type = None
@@ -269,7 +285,7 @@ class DataClient:
         else:
             return None
 
-    def _find_cluster_expr(self, table_name):
+    async def _find_cluster_expr(self, table_name):
         """
            Note: this currently only supports Google Biquery
         """
@@ -281,7 +297,7 @@ class DataClient:
             AND clustering_ordinal_position IS NOT NULL
            ORDER BY clustering_ordinal_position ASC;
         """
-        cluster_fields_result = self.query(cluster_fields_sql)
+        cluster_fields_result = await self.query(cluster_fields_sql)
         cluster_field_exp = ','.join([r['column_name'] for r in cluster_fields_result])
 
         if cluster_field_exp:
@@ -289,20 +305,19 @@ class DataClient:
         else:
             return None
 
-
-    def remove_duplicate_keys_from_bigquery(self, table_name, key_field):
+    async def remove_duplicate_keys_from_bigquery(self, table_name, key_field):
         """Remove any duplicate records when comparing primary keys.
            Note: this currently only supports Google Biquery
         """
-        dups = self.find_duplicate_keys(table_name,  key_field)
+        dups = await self.find_duplicate_keys(table_name, key_field)
         if dups:
             logging.info(f"Removing duplicates from {table_name}: {str(dups)}")
         else:
             logging.info(f"No duplicates found in {table_name}.")
             return
 
-        partition_exp = self._find_partition_expression(table_name)
-        cluster_exp = self._find_cluster_expr(table_name)
+        partition_exp = await self._find_partition_expression(table_name)
+        cluster_exp = await self._find_cluster_expr(table_name)
 
         sql = f"""
                     CREATE OR REPLACE TABLE {table_name}
@@ -317,7 +332,7 @@ class DataClient:
                     )
                 """
         logging.info(sql)
-        self.query(sql)
+        await self.query(sql)
         logging.info("Duplicates removed.")
 
 
@@ -354,7 +369,7 @@ class ELTDBPair:
     def __repr__(self):
         return self.name
 
-    def compare_counts(
+    async def compare_counts(
             self,
             table_name,
             field_name=None,
@@ -363,14 +378,14 @@ class ELTDBPair:
             timestamp_fields: List[str] = None,
             stick_to_dates: bool = False
     ) -> int:
-        return self.target.count(
+        return await self.target.count(
             table_name,
             field_name=field_name,
             start_datetime=start_datetime,
             end_datetime=end_datetime,
             timestamp_fields=timestamp_fields,
             stick_to_dates=stick_to_dates,
-        ) - self.source.count(
+        ) - await self.source.count(
             table_name,
             field_name=field_name,
             start_datetime=start_datetime,
@@ -379,7 +394,7 @@ class ELTDBPair:
             stick_to_dates=stick_to_dates,
         )
 
-    def _find_orphans(
+    async def _find_orphans(
             self,
             table_name,
             key_field,
@@ -394,7 +409,7 @@ class ELTDBPair:
         Optionally pass in timestamp fields and time range to limit the amount of records
         to compare for orphans (for use on large tables).
         """
-        orphans, _ = self._find_orphans_and_missing_in_target(
+        orphans, _ = await self._find_orphans_and_missing_in_target(
             table_name,
             key_field,
             start_datetime=start_datetime,
@@ -405,7 +420,7 @@ class ELTDBPair:
         )
         return orphans
 
-    def find_orphans(
+    async def find_orphans(
             self,
             table_name,
             key_field,
@@ -415,7 +430,7 @@ class ELTDBPair:
             stick_to_dates: bool = False,
             **kwargs,
     ):
-        orphans = self.find_by_recursive_date_range_bifurcation(
+        orphans = await self.find_by_recursive_date_range_bifurcation(
             table_name,
             key_field,
             self._find_orphans,
@@ -428,7 +443,7 @@ class ELTDBPair:
         )
         return orphans
 
-    def remove_orphans_from_target(
+    async def remove_orphans_from_target(
             self,
             table_name,
             key_field,
@@ -439,7 +454,7 @@ class ELTDBPair:
             dry_run: bool = False,
             **kwargs,
     ):
-        orphans = self.find_orphans(
+        orphans = await self.find_orphans(
             table_name,
             key_field,
             start_datetime=start_datetime,
@@ -449,11 +464,11 @@ class ELTDBPair:
             **kwargs,
         )
         if not dry_run:
-            self.target.delete_rows(table_name, key_field, primary_keys=orphans)
+            await self.target.delete_rows(table_name, key_field, primary_keys=orphans)
 
         return orphans
 
-    def find_by_recursive_date_range_bifurcation(
+    async def find_by_recursive_date_range_bifurcation(
             self,
             table_name,
             key_field,
@@ -468,7 +483,7 @@ class ELTDBPair:
             min_segment_size=datetime.timedelta(days=1),
             dry_run=False,
             skip_based_on_count=False,
-    ) -> Set:
+    ) -> Set[Union[str, int]]:
         """
         Do binary search on table by recursively bifurcating the date range
         until the number of records in that range drops below the threshold.
@@ -491,7 +506,7 @@ class ELTDBPair:
         """
         if not timestamp_fields:
             logging.warning("For a more efficient search, specify the timestamp field(s).")
-            return find_func(
+            return await find_func(
                 table_name,
                 key_field,
                 stick_to_dates=stick_to_dates,
@@ -511,7 +526,7 @@ class ELTDBPair:
                 select_stmt=', '.join(map(lambda x: 'MIN({0}) AS {0} '.format(x), timestamp_fields)),
                 table_name=table_name,
             )
-            result = bifurcation_against_lookup[bifurcation_against].query(query)
+            result = await bifurcation_against_lookup[bifurcation_against].query(query)
             start_datetime = min(result[0].values())
             # make timezone aware, assume UTC
             if not end_datetime.tzinfo:
@@ -524,7 +539,7 @@ class ELTDBPair:
                 select_stmt=', '.join(map(lambda x: 'MAX({0}) AS {0} '.format(x), timestamp_fields)),
                 table_name=table_name,
             )
-            result = bifurcation_against_lookup[bifurcation_against].query(query)
+            result = await bifurcation_against_lookup[bifurcation_against].query(query)
             end_datetime = max(result[0].values())
             # make timezone aware, assume UTC
             if not end_datetime.tzinfo:
@@ -542,20 +557,20 @@ class ELTDBPair:
             range_split = [start_datetime + max_segment_size for n in range(range_len)] + [end_datetime]
             find_result = set()
             for sub_start, sub_end in zip(range_split, range_split[1:]):
-                find_result |= self.find_by_recursive_date_range_bifurcation(
-                                table_name,
-                                key_field,
-                                find_func,
-                                bifurcation_against=bifurcation_against,
-                                start_datetime=sub_start,
-                                end_datetime=sub_end,
-                                timestamp_fields=timestamp_fields,
-                                stick_to_dates=stick_to_dates,
-                                thres=thres,
-                                max_segment_size=max_segment_size,
-                                min_segment_size=min_segment_size,
-                                dry_run=dry_run,
-                                skip_based_on_count=skip_based_on_count
+                find_result |= await self.find_by_recursive_date_range_bifurcation(
+                    table_name,
+                    key_field,
+                    find_func,
+                    bifurcation_against=bifurcation_against,
+                    start_datetime=sub_start,
+                    end_datetime=sub_end,
+                    timestamp_fields=timestamp_fields,
+                    stick_to_dates=stick_to_dates,
+                    thres=thres,
+                    max_segment_size=max_segment_size,
+                    min_segment_size=min_segment_size,
+                    dry_run=dry_run,
+                    skip_based_on_count=skip_based_on_count
                 )
             return find_result
 
@@ -575,7 +590,7 @@ class ELTDBPair:
 
         if start != halfway:
             try:
-                count1 = bifurcation_against_lookup[bifurcation_against].count(
+                count1 = await bifurcation_against_lookup[bifurcation_against].count(
                     table_name,
                     field_name=key_field,
                     start_datetime=start,
@@ -591,7 +606,7 @@ class ELTDBPair:
 
         if end != halfway:
             try:
-                count2 = bifurcation_against_lookup[bifurcation_against].count(
+                count2 = await bifurcation_against_lookup[bifurcation_against].count(
                     table_name,
                     field_name=key_field,
                     start_datetime=halfway,
@@ -605,10 +620,9 @@ class ELTDBPair:
                 count2 = thres + 1
                 logging.debug(f"Count 2 timed out, assuming greater than threshold of {thres}.")
 
-
         # exit conditions
         if start == halfway or end == halfway or (halfway - start) < min_segment_size:
-            return find_func(
+            return await find_func(
                 table_name,
                 key_field,
                 start_datetime=start,
@@ -621,7 +635,7 @@ class ELTDBPair:
         if count1 == 0 and count2 == 0:
             return set()
         if count1 < thres and count2 < thres:
-            return find_func(
+            return await find_func(
                 table_name,
                 key_field,
                 start_datetime=start,
@@ -630,7 +644,7 @@ class ELTDBPair:
                 stick_to_dates=stick_to_dates,
                 dry_run=dry_run,
                 skip_based_on_count=skip_based_on_count,
-            ) | find_func(
+            ) | await find_func(
                 table_name,
                 key_field,
                 start_datetime=halfway,
@@ -643,7 +657,7 @@ class ELTDBPair:
 
         # recursion conditions
         if count1 >= thres or count2 >= thres:
-            find_result |= self.find_by_recursive_date_range_bifurcation(
+            find_result |= await self.find_by_recursive_date_range_bifurcation(
                 table_name,
                 key_field,
                 find_func=find_func,
@@ -655,7 +669,7 @@ class ELTDBPair:
                 skip_based_on_count=skip_based_on_count,
                 max_segment_size=max_segment_size,
                 min_segment_size=min_segment_size,
-            ) | self.find_by_recursive_date_range_bifurcation(
+            ) | await self.find_by_recursive_date_range_bifurcation(
                 table_name,
                 key_field,
                 find_func=find_func,
@@ -671,10 +685,10 @@ class ELTDBPair:
 
         return find_result
 
-    def _find_orphans_and_missing_in_target(
+    async def _find_orphans_and_missing_in_target(
             self,
-            table_name,
-            key_field,
+            table_name: str,
+            key_field: str,
             start_datetime: datetime.datetime = None,
             end_datetime: datetime.datetime = None,
             timestamp_fields: List[str] = None,
@@ -687,6 +701,9 @@ class ELTDBPair:
         Optionally pass in timestamp fields and time range to limit the amount of records
         to compare for missing records.
         """
+        if key_field is None:
+            return {}
+
         all_ids_query = f"""
             SELECT {key_field} AS id FROM {table_name}
         """
@@ -702,7 +719,7 @@ class ELTDBPair:
 
         # First compare counts on limited date range to skip id comparison if no difference
         if where_clause and skip_based_on_count:
-            count_diff = self.compare_counts(
+            count_diff = await self.compare_counts(
                 table_name,
                 start_datetime=start_datetime,
                 end_datetime=end_datetime,
@@ -719,17 +736,17 @@ class ELTDBPair:
             else:
                 return str(id)  # cast to str if UUID
 
-        target_rows = self.target.fetch_rows(all_ids_query)
+        target_rows = await self.target.fetch_rows(all_ids_query)
         target_ids = set(map(format_id, target_rows))
 
-        source_rows = self.source.fetch_rows(all_ids_query)
+        source_rows = await self.source.fetch_rows(all_ids_query)
         source_ids = set(map(format_id, source_rows))
 
         missing = source_ids - target_ids
         orphans = target_ids - source_ids
         return orphans, missing
 
-    def _find_missing(
+    async def _find_missing(
             self,
             table_name,
             key_field,
@@ -744,7 +761,7 @@ class ELTDBPair:
         Optionally pass in timestamp fields and time range to limit the amount of records
         to compare for missing records.
         """
-        _, missing = self._find_orphans_and_missing_in_target(
+        _, missing = await self._find_orphans_and_missing_in_target(
             table_name,
             key_field,
             start_datetime=start_datetime,
@@ -755,7 +772,7 @@ class ELTDBPair:
         )
         return missing
 
-    def find_missing(
+    async def find_missing(
             self,
             table_name,
             key_field,
@@ -764,13 +781,13 @@ class ELTDBPair:
             timestamp_fields: List[str] = None,
             stick_to_dates: Optional[bool] = False,
             **kwargs,
-    ) -> Set:
+    ) -> Set[Union[str, int]]:
         """
         Find primary keys of missing records in target for which their source parents were deleted.
         Optionally pass in timestamp fields and time range to limit the amount of records
         to compare for missing records.
         """
-        missing = self.find_by_recursive_date_range_bifurcation(
+        missing = await self.find_by_recursive_date_range_bifurcation(
             table_name,
             key_field,
             self._find_missing,
@@ -783,9 +800,9 @@ class ELTDBPair:
         )
         return missing
 
-    def get_common_tables(self):
-        source_tables = set(self.source.get_all_tables())
-        target_tables = set(self.target.get_all_tables())
+    async def get_common_tables(self):
+        source_tables = set(await self.source.get_all_tables())
+        target_tables = set(await self.target.get_all_tables())
         return sorted(source_tables.intersection(target_tables))
 
     def fill_missing_target_records(self):

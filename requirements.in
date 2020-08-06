@@ -6,13 +6,11 @@
 # This is useful for resolving complicated dependencies.
 
 flake8
-SQLAlchemy
+sqlalchemy-aio
 pybigquery
 pymysql
 psycopg2
 pip-tools
 pytest
-retrying
 sqlalchemy-redshift
 setuptools
-timeout-decorator
